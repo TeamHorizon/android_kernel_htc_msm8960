@@ -3712,6 +3712,7 @@ static int synaptics_ts_suspend(struct i2c_client *client, pm_message_t mesg)
 		if (ret && ts->use_irq) /* if work was pending disable-count is now 2 */
 			enable_irq(client->irq);
 	}
+
 #endif
 	}
 
