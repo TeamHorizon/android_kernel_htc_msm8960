@@ -2565,20 +2565,16 @@ fail_free_intr_pin:
 static void cm3629_early_suspend(struct early_suspend *h)
 {
 	struct cm3629_info *lpi = lp_info;
-
 	D("[LS][cm3629] %s\n", __func__);
-
 	if (lpi->ps_enable == 0)
 		sensor_lpm_power(1);
 	else
 		D("[PS][cm3629] %s: Psensor enable, so did not enter lpm\n", __func__);
 }
-
 static void cm3629_late_resume(struct early_suspend *h)
 {
 	sensor_lpm_power(0);
 	D("[LS][cm3629] %s\n", __func__);
-
 }
 #if 0
 static void release_psensor_wakelock_handler(void)
@@ -2812,7 +2808,7 @@ static int cm3629_probe(struct i2c_client *client,
 	if (ret)
 		goto err_create_ps_device;
 
-	lpi->early_suspend.level =
+        lpi->early_suspend.level =
 			EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
 	lpi->early_suspend.suspend = cm3629_early_suspend;
 	lpi->early_suspend.resume = cm3629_late_resume;
