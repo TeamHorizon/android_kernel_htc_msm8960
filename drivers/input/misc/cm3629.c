@@ -14,7 +14,7 @@
  */
 
 #include <linux/delay.h>
-#include <linux/powersuspend.h>
+#include <linux/earlysuspend.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -97,7 +97,7 @@ struct cm3629_info {
 	struct device *ps_dev;
 	struct input_dev *ls_input_dev;
 	struct input_dev *ps_input_dev;
-	struct power_suspend power_suspend;
+	struct early_suspend early_suspend;
 	struct i2c_client *i2c_client;
 	struct workqueue_struct *lp_wq;
 	struct wake_lock ps_wake_lock;
@@ -2567,27 +2567,20 @@ fail_free_intr_pin:
 	return ret;
 }
 
-#ifdef CONFIG_POWERSUSPEND
-static void cm3629_power_suspend(struct power_suspend *h)
+static void cm3629_early_suspend(struct early_suspend *h)
 {
 	struct cm3629_info *lpi = lp_info;
-
 	D("[LS][cm3629] %s\n", __func__);
-
 	if (lpi->ps_enable == 0)
 		sensor_lpm_power(1);
 	else
 		D("[PS][cm3629] %s: Psensor enable, so did not enter lpm\n", __func__);
 }
-
-
-static void cm3629_late_resume(struct power_suspend *h)
+static void cm3629_late_resume(struct early_suspend *h)
 {
 	sensor_lpm_power(0);
 	D("[LS][cm3629] %s\n", __func__);
-
 }
-#endif
 #if 0
 static void release_psensor_wakelock_handler(void)
 {
@@ -2820,11 +2813,11 @@ static int cm3629_probe(struct i2c_client *client,
 	if (ret)
 		goto err_create_ps_device;
 
-#ifdef CONFIG_POWERSUSPEND
-	lpi->power_suspend.suspend = cm3629_power_suspend;
-	lpi->power_suspend.resume = cm3629_late_resume;
-	register_power_suspend(&lpi->power_suspend);
-#endif
+        lpi->early_suspend.level =
+			EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
+	lpi->early_suspend.suspend = cm3629_early_suspend;
+	lpi->early_suspend.resume = cm3629_late_resume;
+	register_early_suspend(&lpi->early_suspend);
 
 	sensor_lpm_power(0);
 	D("[PS][cm3629] %s: Probe success!\n", __func__);
