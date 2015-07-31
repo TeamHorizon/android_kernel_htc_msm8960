@@ -1047,4 +1047,9 @@ config TOUCHSCREEN_SYNAPTICS_REMOVE_FW_TIMEOUT
 	  Say Y here if your Synaptics touchscreen is prone to
 	  failures when reading the firmware condition.
 
+config TOUCHSCREEN_SYNAPTICS_TAP2WAKE
+	bool "Double tap to wake for Synaptics 3K i2c touchscreen"
+	depends on TOUCHSCREEN_SYNAPTICS_3K
+	default n
+
 endif
