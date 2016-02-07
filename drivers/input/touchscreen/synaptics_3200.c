@@ -205,7 +205,7 @@ static void syn_handle_block_touch(struct synaptics_ts_data *ts, int enable)
 #endif
 
 static bool scr_suspended = false;
-static int t2w_switch = 0; // 0=disabled, 1=double-tap2wake
+static int t2w_switch = 1; // 0=disabled, 1=double-tap2wake
 static unsigned long pwrtrigger_time[2] = {0, 0};
 
 static struct input_dev * tap2wake_pwrdev = NULL;
