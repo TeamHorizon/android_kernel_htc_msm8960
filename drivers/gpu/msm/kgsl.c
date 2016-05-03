@@ -436,6 +436,17 @@ kgsl_mem_entry_untrack_gpuaddr(struct kgsl_process_private *process,
 	}
 }
 
+/* Commit the entry to the process so it can be accessed by other operations */
+static void kgsl_mem_entry_commit_process(struct kgsl_mem_entry *entry)
+{
+	if (!entry)
+		return;
+
+	spin_lock(&entry->priv->mem_lock);
+	idr_replace(&entry->priv->mem_idr, entry, entry->id);
+	spin_unlock(&entry->priv->mem_lock);
+}
+
 /**
  * kgsl_mem_entry_attach_process - Attach a mem_entry to its owner process
  * @entry: the memory entry
@@ -2206,6 +2217,97 @@ static int kgsl_setup_ion(struct kgsl_mem_entry *entry,
 		entry->memdesc.sglen++;
 	}
 
+	ret = _copy_from_user(&buf, to_user_ptr(param->priv),
+			sizeof(buf), param->priv_len);
+	if (ret)
+		return ret;
+
+	if (buf.fd == 0)
+		return -EINVAL;
+
+	*fd = buf.fd;
+	dmabuf = dma_buf_get(buf.fd);
+
+	if (IS_ERR_OR_NULL(dmabuf))
+		return (dmabuf == NULL) ? -EINVAL : PTR_ERR(dmabuf);
+
+	ret = kgsl_setup_dma_buf(device, pagetable, entry, dmabuf);
+	if (ret)
+		dma_buf_put(dmabuf);
+
+	return ret;
+}
+#else
+static long _gpuobj_map_dma_buf(struct kgsl_device *device,
+		struct kgsl_pagetable *pagetable,
+		struct kgsl_mem_entry *entry,
+		struct kgsl_gpuobj_import *param,
+		int *fd)
+{
+	return -EINVAL;
+}
+#endif
+
+long kgsl_ioctl_gpuobj_import(struct kgsl_device_private *dev_priv,
+		unsigned int cmd, void *data)
+{
+	struct kgsl_process_private *private = dev_priv->process_priv;
+	struct kgsl_gpuobj_import *param = data;
+	struct kgsl_mem_entry *entry;
+	int ret, fd = -1;
+	struct kgsl_mmu *mmu = &dev_priv->device->mmu;
+
+	entry = kgsl_mem_entry_create();
+	if (entry == NULL)
+		return -ENOMEM;
+
+	param->flags &= KGSL_MEMFLAGS_GPUREADONLY
+			| KGSL_MEMTYPE_MASK
+			| KGSL_MEMALIGN_MASK
+			| KGSL_MEMFLAGS_USE_CPU_MAP
+			| KGSL_MEMFLAGS_SECURE
+			| KGSL_MEMFLAGS_FORCE_32BIT;
+
+	entry->memdesc.flags = param->flags;
+
+	if (MMU_FEATURE(mmu, KGSL_MMU_NEED_GUARD_PAGE))
+		entry->memdesc.priv |= KGSL_MEMDESC_GUARD_PAGE;
+
+	if (param->type == KGSL_USER_MEM_TYPE_ADDR)
+		ret = _gpuobj_map_useraddr(dev_priv->device, private->pagetable,
+			entry, param);
+	else if (param->type == KGSL_USER_MEM_TYPE_DMABUF)
+		ret = _gpuobj_map_dma_buf(dev_priv->device, private->pagetable,
+			entry, param, &fd);
+	else
+		ret = -ENOTSUPP;
+
+	if (ret)
+		goto out;
+
+	if (entry->memdesc.size >= SZ_1M)
+		kgsl_memdesc_set_align(&entry->memdesc, ilog2(SZ_1M));
+	else if (entry->memdesc.size >= SZ_64K)
+		kgsl_memdesc_set_align(&entry->memdesc, ilog2(SZ_64K));
+
+	param->flags = entry->memdesc.flags;
+
+	ret = kgsl_mem_entry_attach_process(entry, dev_priv);
+	if (ret)
+		goto unmap;
+
+	param->id = entry->id;
+
+	KGSL_STATS_ADD(entry->memdesc.size, &kgsl_driver.stats.mapped,
+		&kgsl_driver.stats.mapped_max);
+
+	kgsl_process_add_stats(private,
+		kgsl_memdesc_usermem_type(&entry->memdesc),
+		entry->memdesc.size);
+
+	trace_kgsl_mem_map(entry, fd);
+
+	kgsl_mem_entry_commit_process(entry);
 	return 0;
 err:
 	ion_free(kgsl_ion_client, handle);
@@ -2337,7 +2439,7 @@ static long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 
 	trace_kgsl_mem_map(entry, param->fd);
 
-	kgsl_mem_entry_commit_process(private, entry);
+	kgsl_mem_entry_commit_process(entry);
 	return result;
 
 error_attach:
@@ -2487,8 +2589,8 @@ _gpumem_alloc(struct kgsl_device_private *dev_priv,
 
 	entry->memtype = KGSL_MEM_ENTRY_KERNEL;
 
-	*ret_entry = entry;
-	return result;
+	kgsl_mem_entry_commit_process(entry);
+	return entry;
 err:
 	kfree(entry);
 	*ret_entry = NULL;
