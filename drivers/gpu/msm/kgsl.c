@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2012,2014 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -338,27 +338,21 @@ kgsl_mem_entry_destroy(struct kref *kref)
 EXPORT_SYMBOL(kgsl_mem_entry_destroy);
 
 /**
- * kgsl_mem_entry_track_gpuaddr - Insert a mem_entry in the address tree and
- * assign it with a gpu address space before insertion
+ * kgsl_mem_entry_track_gpuaddr - Get the entry gpu address space before
+ * insertion to the process
  * @process: the process that owns the memory
  * @entry: the memory entry
  *
- * @returns - 0 on succcess else error code
+ * @returns - 0 on success else error code
  *
- * Insert the kgsl_mem_entry in to the rb_tree for searching by GPU address.
- * The assignment of gpu address and insertion into list needs to
- * happen with the memory lock held to avoid race conditions between
- * gpu address being selected and some other thread looking through the
- * rb list in search of memory based on gpuaddr
  * This function should be called with processes memory spinlock held
- */
+*/
 static int
 kgsl_mem_entry_track_gpuaddr(struct kgsl_process_private *process,
 				struct kgsl_mem_entry *entry)
 {
 	int ret = 0;
-	struct rb_node **node;
-	struct rb_node *parent = NULL;
+	struct kgsl_pagetable *pagetable = process->pagetable;
 
 	assert_spin_locked(&process->mem_lock);
 	/*
@@ -373,14 +367,26 @@ kgsl_mem_entry_track_gpuaddr(struct kgsl_process_private *process,
 		ret = -EINVAL;
 		goto done;
 	}
-	if (!kgsl_memdesc_use_cpu_map(&entry->memdesc)) {
-		ret = kgsl_mmu_get_gpuaddr(process->pagetable, &entry->memdesc);
-		if (ret)
-			goto done;
-	}
+	if (kgsl_memdesc_is_secured(&entry->memdesc))
+		pagetable = pagetable->mmu->securepagetable;
 
+	ret = kgsl_mmu_get_gpuaddr(pagetable, &entry->memdesc);
+
+done:
+	return ret;
+}
+
+static void kgsl_mem_entry_commit_mem_list(struct kgsl_process_private *process,
+				struct kgsl_mem_entry *entry)
+{
+	struct rb_node **node;
+	struct rb_node *parent = NULL;
+
+	if (!entry->memdesc.gpuaddr)
+		return;
+
+	/* Insert mem entry in mem_rb tree */
 	node = &process->mem_rb.rb_node;
-
 	while (*node) {
 		struct kgsl_mem_entry *cur;
 
@@ -395,9 +401,20 @@ kgsl_mem_entry_track_gpuaddr(struct kgsl_process_private *process,
 
 	rb_link_node(&entry->node, parent, node);
 	rb_insert_color(&entry->node, &process->mem_rb);
+}
 
-done:
-	return ret;
+static void kgsl_mem_entry_commit_process(struct kgsl_process_private *process,
+				struct kgsl_mem_entry *entry)
+{
+	if (!entry)
+		return;
+
+	spin_lock(&entry->priv->mem_lock);
+	/* Insert mem entry in mem_rb tree */
+	kgsl_mem_entry_commit_mem_list(process, entry);
+	/* Replace mem entry in mem_idr using id */
+	idr_replace(&entry->priv->mem_idr, entry, entry->id);
+	spin_unlock(&entry->priv->mem_lock);
 }
 
 /**
@@ -441,6 +458,12 @@ kgsl_mem_entry_attach_process(struct kgsl_mem_entry *entry,
 	ret = kgsl_process_private_get(process);
 	if (!ret)
 		return -EBADF;
+	idr_preload(GFP_KERNEL);
+	spin_lock(&process->mem_lock);
+	/* Allocate the ID but don't attach the pointer just yet */
+	id = idr_alloc(&process->mem_idr, NULL, 1, 0, GFP_NOWAIT);
+	spin_unlock(&process->mem_lock);
+	idr_preload_end();
 
 	while (1) {
 		if (idr_pre_get(&process->mem_idr, GFP_KERNEL) == 0) {
@@ -2314,6 +2337,7 @@ static long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 
 	trace_kgsl_mem_map(entry, param->fd);
 
+	kgsl_mem_entry_commit_process(private, entry);
 	return result;
 
 error_attach:
@@ -2495,6 +2519,8 @@ kgsl_ioctl_gpumem_alloc(struct kgsl_device_private *dev_priv,
 	param->gpuaddr = entry->memdesc.gpuaddr;
 	param->size = entry->memdesc.size;
 	param->flags = entry->memdesc.flags;
+
+	kgsl_mem_entry_commit_process(private, entry);
 	return result;
 err:
 	kgsl_sharedmem_free(&entry->memdesc);
@@ -2530,6 +2556,8 @@ kgsl_ioctl_gpumem_alloc_id(struct kgsl_device_private *dev_priv,
 	param->size = entry->memdesc.size;
 	param->mmapsize = kgsl_memdesc_mmapsize(&entry->memdesc);
 	param->gpuaddr = entry->memdesc.gpuaddr;
+
+	kgsl_mem_entry_commit_process(private, entry);
 	return result;
 err:
 	if (entry)
@@ -3024,7 +3052,175 @@ err_put:
 static inline bool
 mmap_range_valid(unsigned long addr, unsigned long len)
 {
-	return ((ULONG_MAX - addr) > len) && ((addr + len) < TASK_SIZE);
+	return ((ULONG_MAX - addr) > len) && ((addr + len) <=
+		KGSL_SVM_UPPER_BOUND) && (addr >= KGSL_SVM_LOWER_BOUND);
+}
+
+/**
+ * __kgsl_check_collision() - Find a non colliding gpuaddr for the process
+ * @private: Process private pointer contaning the list of allocations
+ * @entry: The entry colliding with given address
+ * @gpuaddr: In out parameter. The In parameter contains the desired gpuaddr
+ * if the gpuaddr collides then the out parameter contains the non colliding
+ * address
+ * @len: Length of address range
+ * @flag_top_down: Indicates whether free address range should be checked in
+ * top down or bottom up fashion
+ */
+static int __kgsl_check_collision(struct kgsl_process_private *private,
+			struct kgsl_mem_entry *entry,
+			unsigned long *gpuaddr, unsigned long len,
+			int flag_top_down)
+{
+	int ret = 0;
+	unsigned long addr = *gpuaddr;
+	struct kgsl_mem_entry *collision_entry = entry;
+	struct rb_node *node, *node_first, *node_last;
+
+	if (!collision_entry)
+		return -ENOENT;
+
+	node = &(collision_entry->node);
+	node_first = rb_first(&private->mem_rb);
+	node_last = rb_last(&private->mem_rb);
+
+	while (1) {
+		/*
+		 * If top down search then next address to consider
+		 * is lower. The highest lower address possible is the
+		 * colliding entry address - the length of
+		 * allocation
+		 */
+		if (flag_top_down) {
+			addr = collision_entry->memdesc.gpuaddr - len;
+			/* Check for loopback */
+			if (addr > collision_entry->memdesc.gpuaddr || !addr) {
+				*gpuaddr = KGSL_SVM_UPPER_BOUND;
+				ret = -EAGAIN;
+				break;
+			}
+			if (node == node_first) {
+				collision_entry = NULL;
+			} else {
+				node = rb_prev(&collision_entry->node);
+				collision_entry = container_of(node,
+					struct kgsl_mem_entry, node);
+			}
+		} else {
+			/*
+			 * Bottom up mode the next address to consider
+			 * is higher. The lowest higher address possible
+			 * colliding entry address + the size of the
+			 * colliding entry
+			 */
+			addr = collision_entry->memdesc.gpuaddr +
+				kgsl_memdesc_mmapsize(
+					&collision_entry->memdesc);
+			/* overflow check */
+			if (addr < collision_entry->memdesc.gpuaddr ||
+				!mmap_range_valid(addr, len)) {
+				*gpuaddr = KGSL_SVM_UPPER_BOUND;
+				ret = -EAGAIN;
+				break;
+			}
+			if (node == node_last) {
+				collision_entry = NULL;
+			} else {
+				node = rb_next(&collision_entry->node);
+				collision_entry = container_of(node,
+					struct kgsl_mem_entry, node);
+			}
+		}
+
+		if (!collision_entry ||
+			!kgsl_addr_range_overlap(addr, len,
+			collision_entry->memdesc.gpuaddr,
+			kgsl_memdesc_mmapsize(&collision_entry->memdesc))) {
+			/* success */
+			*gpuaddr = addr;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+/**
+ * kgsl_check_gpu_addr_collision() - Check if an address range collides with
+ * existing allocations of a process
+ * @private: Pointer to process private
+ * @entry: Memory entry of the memory for which address range is being
+ * considered
+ * @addr: Start address of the address range for which collision is checked
+ * @len: Length of the address range
+ * @gpumap_free_addr: The lowest address from where to look for a free address
+ * range because addresses below this are known to conflict
+ * @flag_top_down: Indicates whether to search for unmapped region in top down
+ * or bottom mode
+ * @align: The alignment requirement of the unmapped region
+ *
+ * Function checks if the given address range collides, and if collision
+ * is found then it keeps incrementing the gpumap_free_addr until it finds
+ * an address that does not collide. This suggested addr can be used by the
+ * caller to check if it's acceptable.
+ */
+static int kgsl_check_gpu_addr_collision(
+				struct kgsl_process_private *private,
+				struct kgsl_mem_entry *entry,
+				unsigned long addr, unsigned long len,
+				unsigned long *gpumap_free_addr,
+				bool flag_top_down,
+				unsigned int align)
+{
+	int ret = -EAGAIN;
+	struct kgsl_mem_entry *collision_entry = NULL;
+	spin_lock(&private->mem_lock);
+	if (kgsl_sharedmem_region_empty(private, addr, len, &collision_entry)) {
+		/*
+		 * We found a free memory map, claim it here with
+		 * memory lock held
+		 */
+		entry->memdesc.gpuaddr = addr;
+		/* This should never fail */
+		ret = kgsl_mem_entry_track_gpuaddr(private, entry);
+		spin_unlock(&private->mem_lock);
+		BUG_ON(ret);
+		/* map cannot be called with lock held */
+		ret = kgsl_mmu_map(private->pagetable,
+					&entry->memdesc);
+		if (ret) {
+			spin_lock(&private->mem_lock);
+			kgsl_mem_entry_untrack_gpuaddr(private, entry);
+			spin_unlock(&private->mem_lock);
+		} else {
+			/* Insert mem entry in mem_rb tree */
+			spin_lock(&private->mem_lock);
+			kgsl_mem_entry_commit_mem_list(private, entry);
+			spin_unlock(&private->mem_lock);
+		}
+	} else {
+		trace_kgsl_mem_unmapped_area_collision(entry, addr, len,
+							ret);
+		if (!gpumap_free_addr) {
+			spin_unlock(&private->mem_lock);
+			return ret;
+		}
+		/*
+		 * When checking for a free gap make sure the gap is large
+		 * enough to accomodate alignment
+		 */
+		len += 1 << align;
+
+		ret = __kgsl_check_collision(private, collision_entry, &addr,
+						len, flag_top_down);
+		if (!ret || -EAGAIN == ret) {
+			*gpumap_free_addr = addr;
+			ret = -EAGAIN;
+		}
+
+		spin_unlock(&private->mem_lock);
+	}
+	return ret;
 }
 
 static unsigned long
