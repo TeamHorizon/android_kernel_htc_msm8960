@@ -161,8 +161,8 @@ extern unsigned int get_tamper_sf(void);
 #ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_SWEEP2WAKE
 
 int s2w_switch = 0;
-int dt2w_switch = 0;
-int pocket_detect = 0;
+int dt2w_switch = 1;
+int pocket_detect = 1;
 int s2w_wakestat = 0;
 cputime64_t dt2w_time[2] = {0, 0}; 
 #define DT2W_TIMEOUT_MAX 275 
