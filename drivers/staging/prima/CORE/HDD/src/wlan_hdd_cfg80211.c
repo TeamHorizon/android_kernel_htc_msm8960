@@ -706,7 +706,7 @@ int wlan_hdd_cfg80211_init(struct device *dev,
 
        if (NULL == wiphy->bands[i])
        {
-          hddLog(VOS_TRACE_LEVEL_ERROR,"%s: wiphy->bands[i] is NULL, i = %d",
+          hddLog(VOS_TRACE_LEVEL_INFO,"%s: wiphy->bands[i] is NULL, i = %d",
                  __func__, i);
           continue;
        }
@@ -771,13 +771,22 @@ int wlan_hdd_cfg80211_register(struct wiphy *wiphy)
 int wlan_hdd_get_crda_regd_entry(struct wiphy *wiphy, hdd_config_t *pCfg)
 {
    hdd_context_t *pHddCtx = wiphy_priv(wiphy);
+   int status;
+
    if (memcmp(pCfg->crdaDefaultCountryCode,
               CFG_CRDA_DEFAULT_COUNTRY_CODE_DEFAULT , 2) != 0)
    {
-      init_completion(&pHddCtx->driver_crda_req);
+      INIT_COMPLETION(pHddCtx->driver_crda_req);
       regulatory_hint(wiphy, pCfg->crdaDefaultCountryCode);
-      wait_for_completion_interruptible_timeout(&pHddCtx->driver_crda_req,
-        CRDA_WAIT_TIME);
+      status = wait_for_completion_interruptible_timeout(
+              &pHddCtx->driver_crda_req,
+              msecs_to_jiffies(CRDA_WAIT_TIME));
+      if (!status)
+      {
+          hddLog(VOS_TRACE_LEVEL_ERROR,"%s: timeout waiting for CRDA REQ",
+                  __func__);
+      }
+
       /* if the country is not found from current regulatory.bin,
          fall back to world domain */
       if (is_crda_regulatory_entry_valid() == VOS_FALSE)
@@ -5577,7 +5586,7 @@ static int wlan_hdd_cfg80211_set_cipher( hdd_adapter_t *pAdapter,
 
     if (!cipher)
     {
-        hddLog(VOS_TRACE_LEVEL_ERROR, "%s: received cipher %d - considering none",
+        hddLog(VOS_TRACE_LEVEL_INFO, "%s: received cipher %d - considering none",
                 __func__, cipher);
         encryptionType = eCSR_ENCRYPT_TYPE_NONE;
     }
