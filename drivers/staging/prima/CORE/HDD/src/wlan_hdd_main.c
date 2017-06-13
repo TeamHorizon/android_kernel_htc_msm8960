@@ -211,7 +211,6 @@ extern int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr);
 #if  defined (WLAN_FEATURE_VOWIFI_11R) || defined (FEATURE_WLAN_CCX) || defined(FEATURE_WLAN_LFR)
 void hdd_getBand_helper(hdd_context_t *pHddCtx, int *pBand);
 static VOS_STATUS hdd_parse_channellist(tANI_U8 *pValue, tANI_U8 *pChannelList, tANI_U8 *pNumChannels);
-static VOS_STATUS hdd_parse_countryrev(tANI_U8 *pValue, tANI_U8 *pChannelList, tANI_U8 *pNumChannels);
 static VOS_STATUS hdd_parse_send_action_frame_data(tANI_U8 *pValue, tANI_U8 *pTargetApBssid,
                               tANI_U8 *pChannel, tANI_U8 *pDwellTime,
                               tANI_U8 **pBuf, tANI_U8 *pBufLen);
@@ -665,15 +664,29 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
            country_code = command + 8;
 
+           INIT_COMPLETION(pAdapter->change_country_code);
            hdd_checkandupdate_dfssetting(pAdapter, country_code);
            hdd_checkandupdate_phymode(pAdapter, country_code);
-           ret = (int)sme_ChangeCountryCode(pHddCtx->hHal, NULL, country_code,
-                    pAdapter, pHddCtx->pvosContext, eSIR_TRUE);
-           if( 0 != ret )
+           ret = (int)sme_ChangeCountryCode(pHddCtx->hHal,
+                  (void *)(tSmeChangeCountryCallback)
+                    wlan_hdd_change_country_code_callback,
+                     country_code, pAdapter, pHddCtx->pvosContext, eSIR_TRUE);
+           if (eHAL_STATUS_SUCCESS == ret)
+           {
+               ret = wait_for_completion_interruptible_timeout(
+                       &pAdapter->change_country_code,
+                            msecs_to_jiffies(WLAN_WAIT_TIME_COUNTRY));
+               if (0 >= ret)
+               {
+                   hddLog(VOS_TRACE_LEVEL_ERROR, "%s: SME while setting country code timed out",
+                   __func__);
+               }
+           }
+           else
            {
                VOS_TRACE( VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_FATAL,
-                       "%s: SME Change Country code fail ret=%d\n",__func__, ret);
-
+                 "%s: SME Change Country code fail ret=%d", __func__, ret);
+               ret = -EINVAL;
            }
            /* If you get a 00 country code it means you are world roaming.
            In case of world roaming, country code should be updated by
@@ -684,69 +697,6 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
               regulatory_hint(wiphy, "00");
            }
        }
-#if  defined (WLAN_FEATURE_VOWIFI_11R) || defined (FEATURE_WLAN_CCX) || defined(FEATURE_WLAN_LFR)
-       else if ( strncasecmp(command, "SETCOUNTRYREV", 13) == 0 )
-       {
-           tANI_U8 *value = command;
-           tANI_U8 countryCode[WNI_CFG_COUNTRY_CODE_LEN] = {0};
-           tANI_U8 revision = 0;
-           eHalStatus status = eHAL_STATUS_SUCCESS;
-           v_REGDOMAIN_t regId;
-
-           status = hdd_parse_countryrev(value, countryCode, &revision);
-           if (eHAL_STATUS_SUCCESS != status)
-           {
-               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                  "%s: Failed to parse country revision information", __func__);
-               ret = -EINVAL;
-               goto exit;
-           }
-
-           /* Validate country code */
-           status = sme_GetRegulatoryDomainForCountry(pHddCtx->hHal, countryCode, &regId);
-           if (eHAL_STATUS_SUCCESS != status)
-           {
-               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                  "%s: Invalid country code %s", __func__, countryCode);
-               ret = -EINVAL;
-               goto exit;
-           }
-
-           /* Validate revision */
-           if ((SME_KR_3 != revision) && (SME_KR_24 != revision) && (SME_KR_25 != revision))
-           {
-               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                  "%s: Invalid revision %d", __func__, revision);
-               ret = -EINVAL;
-               goto exit;
-           }
-
-           hdd_checkandupdate_dfssetting(pAdapter, countryCode);
-           hdd_checkandupdate_phymode(pAdapter, countryCode);
-           ret = (int)sme_ChangeCountryCode(pHddCtx->hHal, NULL, countryCode,
-                    pAdapter, pHddCtx->pvosContext, eSIR_TRUE);
-           if (0 != ret)
-           {
-               VOS_TRACE( VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
-                       "%s: SME Change Country code fail ret=%d", __func__, ret);
-               ret = -EINVAL;
-               goto exit;
-           }
-
-           if (0 == strncmp(countryCode, "KR", 2))
-           {
-               status = sme_ChangeCountryValidChannelListByRevision((tHalHandle)(pHddCtx->hHal),
-                                                       revision);
-               if (eHAL_STATUS_SUCCESS != status)
-               {
-                   VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                             "%s: Failed to build valid channel list", __func__);
-                   ret = -EINVAL;
-                   goto exit;
-               }
-           }
-       }
-#endif
        /*
           command should be a string having format
           SET_SAP_CHANNEL_LIST <num of channels> <the channels seperated by spaces>
@@ -1104,39 +1054,6 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
            hdd_getBand_helper(pHddCtx, &band);
 
            len = scnprintf(extra, sizeof(extra), "%s %d", command, band);
-           if (copy_to_user(priv_data.buf, &extra, len + 1))
-           {
-               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                  "%s: failed to copy data to user buffer", __func__);
-               ret = -EFAULT;
-               goto exit;
-           }
-       }
-       else if (strncmp(command, "GETCOUNTRYREV", 13) == 0)
-       {
-           tANI_U8 pBuf[WNI_CFG_COUNTRY_CODE_LEN];
-           tANI_U8 uBufLen = WNI_CFG_COUNTRY_CODE_LEN;
-           tANI_U8 revision = 0;
-           /* The format of the data copied to the user is GETCOUNTRYREV KR 25,
-              hence size of the array is country code + whitespace + 2 byte revision + ASCII NUL */
-           char extra[32] = {0};
-           tANI_U8 len = 0;
-
-           if (eHAL_STATUS_SUCCESS != sme_GetCountryCode( (tHalHandle)(pHddCtx->hHal), pBuf, &uBufLen ))
-           {
-               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_FATAL,
-                  "%s: failed to get country code", __func__);
-               ret = -EFAULT;
-               goto exit;
-           }
-           pBuf[uBufLen] = '\0';
-           sme_GetCountryRevision((tHalHandle)(pHddCtx->hHal), &revision);
-
-           if (0 == strncmp(pBuf, "KR", 2))
-               len = scnprintf(extra, sizeof(extra), "%s %s %u", command, pBuf, revision);
-           else
-               len = scnprintf(extra, sizeof(extra), "%s %s", command, pBuf);
-
            if (copy_to_user(priv_data.buf, &extra, len + 1))
            {
                VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
@@ -2180,7 +2097,7 @@ void hdd_getBand_helper(hdd_context_t *pHddCtx, int *pBand)
   This function parses the send action frame data passed in the format
   SENDACTIONFRAME<space><bssid><space><channel><space><dwelltime><space><data>
 
-  \param  - pValue Pointer to input country code revision
+  \param  - pValue Pointer to input data
   \param  - pTargetApBssid Pointer to target Ap bssid
   \param  - pChannel Pointer to the Target AP channel
   \param  - pDwellTime Pointer to the time to stay off-channel after transmitting action frame
@@ -2346,86 +2263,6 @@ VOS_STATUS hdd_parse_send_action_frame_data(tANI_U8 *pValue, tANI_U8 *pTargetApB
 
 /**---------------------------------------------------------------------------
 
-  \brief hdd_parse_countryrev() - HDD Parse country code revision
-
-  This function parses the country code revision passed in the format
-  SETCOUNTRYREV<space><Country code><space>revision
-
-  \param  - pValue Pointer to input country code revision
-  \param  - pCountryCode Pointer to local output array to record country code
-  \param  - pRevision Pointer to store revision integer number
-
-  \return - 0 for success non-zero for failure
-
-  --------------------------------------------------------------------------*/
-VOS_STATUS hdd_parse_countryrev(tANI_U8 *pValue, tANI_U8 *pCountryCode, tANI_U8 *pRevision)
-{
-    tANI_U8 *inPtr = pValue;
-    int tempInt;
-
-    inPtr = strnchr(pValue, strlen(pValue), SPACE_ASCII_VALUE);
-    /*no argument after the command*/
-    if (NULL == inPtr)
-    {
-        return -EINVAL;
-    }
-
-    /*no space after the command*/
-    else if (SPACE_ASCII_VALUE != *inPtr)
-    {
-        return -EINVAL;
-    }
-
-    /*removing empty spaces*/
-    while ((SPACE_ASCII_VALUE  == *inPtr)&& ('\0' !=  *inPtr) ) inPtr++;
-
-    /*no argument followed by spaces*/
-    if ('\0' == *inPtr)
-    {
-        return -EINVAL;
-    }
-
-    /*getting the first argument ie the country code */
-    sscanf(inPtr, "%3s ", pCountryCode);
-
-    VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO_HIGH,
-               "Country code is : %s", pCountryCode);
-
-    /*inPtr pointing to the beginning of first space after country code */
-    inPtr = strpbrk( inPtr, " " );
-    /*no revision number after the country code argument */
-    if (NULL == inPtr)
-    {
-        return -EINVAL;
-    }
-
-    inPtr++;
-
-    /*removing empty space*/
-    while ((SPACE_ASCII_VALUE == *inPtr) && ('\0' != *inPtr) ) inPtr++;
-
-    /*no channel list after the number of channels argument and spaces*/
-    if (0 == strncmp(pCountryCode, "KR", 2))
-    {
-        if ('\0' == *inPtr)
-        {
-            return -EINVAL;
-        }
-
-        sscanf(inPtr, "%d", &tempInt);
-        *pRevision = tempInt;
-    }
-    else
-    {
-        VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO_HIGH,
-               "Revision input is required only for Country KR");
-        return -EINVAL;
-    }
-    return VOS_STATUS_SUCCESS;
-}
-
-/**---------------------------------------------------------------------------
-
   \brief hdd_parse_channellist() - HDD Parse channel list
 
   This function parses the channel list passed in the format
@@ -2548,7 +2385,7 @@ VOS_STATUS hdd_parse_channellist(tANI_U8 *pValue, tANI_U8 *pChannelList, tANI_U8
   This function parses the reasoc command data passed in the format
   REASSOC<space><bssid><space><channel>
 
-  \param  - pValue Pointer to input data (its a NUL terminated string)
+  \param  - pValue Pointer to input data
   \param  - pTargetApBssid Pointer to target Ap bssid
   \param  - pChannel Pointer to the Target AP channel
 
@@ -3321,6 +3158,7 @@ static hdd_adapter_t* hdd_alloc_station_adapter( hdd_context_t *pHddCtx, tSirMac
       init_completion(&pHddCtx->tx_sus_event_var);
       init_completion(&pHddCtx->rx_sus_event_var);
       init_completion(&pAdapter->ula_complete);
+      init_completion(&pAdapter->change_country_code);
 
       pAdapter->isLinkUpSvcNeeded = FALSE; 
       pAdapter->higherDtimTransition = eANI_BOOLEAN_TRUE;
@@ -3947,11 +3785,11 @@ hdd_adapter_t* hdd_open_adapter( hdd_context_t *pHddCtx, tANI_U8 session_type,
          ret = register_inetaddr_notifier(&pAdapter->ipv4_notifier);
          if (ret)
          {
-             hddLog(LOGE, FL("Failed to register IPv4 notifier"));
+             hddLog(VOS_TRACE_LEVEL_ERROR, FL("Failed to register IPv4 notifier"));
          }
          else
          {
-             hddLog(LOG1, FL("Registered IPv4 notifier"));
+             hddLog(VOS_TRACE_LEVEL_INFO, FL("Registered IPv4 notifier"));
              pAdapter->ipv4_notifier_registered = true;
          }
 
@@ -3964,11 +3802,11 @@ hdd_adapter_t* hdd_open_adapter( hdd_context_t *pHddCtx, tANI_U8 session_type,
          ret = register_inet6addr_notifier(&pAdapter->ipv6_notifier);
          if (ret)
          {
-             hddLog(LOGE, FL("Failed to register IPv6 notifier"));
+             hddLog(VOS_TRACE_LEVEL_ERROR, FL("Failed to register IPv6 notifier"));
          }
          else
          {
-             hddLog(LOG1, FL("Registered IPv6 notifier"));
+             hddLog(VOS_TRACE_LEVEL_INFO, FL("Registered IPv6 notifier"));
              pAdapter->ipv6_notifier_registered = true;
          }
 #endif
@@ -5878,6 +5716,7 @@ int hdd_wlan_startup(struct device *dev )
    init_completion(&pHddCtx->scan_info.abortscan_event_var);
    init_completion(&pHddCtx->wiphy_channel_update_event);
    init_completion(&pHddCtx->ssr_comp_var);
+   init_completion(&pHddCtx->driver_crda_req);
 
    spin_lock_init(&pHddCtx->schedScan_lock);
 
@@ -5891,7 +5730,8 @@ int hdd_wlan_startup(struct device *dev )
    mutex_init(&pHddCtx->tdls_lock);
 #endif
 
-   pHddCtx->nEnableStrictRegulatoryForFCC = TRUE;
+   /* By default Strict Regulatory For FCC should be false */
+   pHddCtx->nEnableStrictRegulatoryForFCC = FALSE;
    // Load all config first as TL config is needed during vos_open
    pHddCtx->cfg_ini = (hdd_config_t*) kmalloc(sizeof(hdd_config_t), GFP_KERNEL);
    if(pHddCtx->cfg_ini == NULL)
