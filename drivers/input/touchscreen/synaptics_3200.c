@@ -197,7 +197,7 @@ static void sweep2wake_presspwr(struct work_struct * sweep2wake_presspwr_work) {
 	int pocket_mode = 0;
 	
 	if (scr_suspended == true && pocket_detect == 1)
-		pocket_mode = pocket_detection_check();
+		pocket_mode = power_key_check_in_pocket_no_light();
 
 	if (!pocket_mode || pocket_detect == 0) {
 
