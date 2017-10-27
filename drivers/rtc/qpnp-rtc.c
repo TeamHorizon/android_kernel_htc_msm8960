@@ -1,4 +1,4 @@
-/* Copyright (c) 2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -44,6 +44,12 @@
 
 #define TO_SECS(arr)		(arr[0] | (arr[1] << 8) | (arr[2] << 16) | \
 							(arr[3] << 24))
+
+/* Module parameter to control power-on-alarm */
+bool poweron_alarm;
+module_param(poweron_alarm, bool, 0644);
+MODULE_PARM_DESC(poweron_alarm, "Enable/Disable power-on alarm");
+EXPORT_SYMBOL(poweron_alarm);
 
 /* rtc driver internal structure */
 struct qpnp_rtc {
@@ -350,6 +356,7 @@ qpnp_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
 	unsigned long irq_flags;
 	struct qpnp_rtc *rtc_dd = dev_get_drvdata(dev);
 	u8 ctrl_reg;
+	u8 value[4] = {0};
 
 	spin_lock_irqsave(&rtc_dd->alarm_ctrl_lock, irq_flags);
 	ctrl_reg = rtc_dd->alarm_ctrl_reg1;
@@ -364,6 +371,15 @@ qpnp_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
 	}
 
 	rtc_dd->alarm_ctrl_reg1 = ctrl_reg;
+
+	/* Clear Alarm register */
+	if (!enabled) {
+		rc = qpnp_write_wrapper(rtc_dd, value,
+			rtc_dd->alarm_base + REG_OFFSET_ALARM_RW,
+			NUM_8_BIT_RTC_REGS);
+		if (rc)
+			dev_err(dev, "Clear ALARM value reg failed\n");
+	}
 
 rtc_rw_fail:
 	spin_unlock_irqrestore(&rtc_dd->alarm_ctrl_lock, irq_flags);
@@ -581,7 +597,7 @@ static void qpnp_rtc_shutdown(struct spmi_device *spmi)
 	struct qpnp_rtc *rtc_dd = dev_get_drvdata(&spmi->dev);
 	bool rtc_alarm_powerup = rtc_dd->rtc_alarm_powerup;
 
-	if (!rtc_alarm_powerup) {
+	if (!rtc_alarm_powerup && !poweron_alarm) {
 		spin_lock_irqsave(&rtc_dd->alarm_ctrl_lock, irq_flags);
 		dev_dbg(&spmi->dev, "Disabling alarm interrupts\n");
 

@@ -1,3 +1,4 @@
+
 /*
  * Copyright (C) 2010 NXP Semiconductors
  */
@@ -14,4 +15,6 @@ struct pn544_i2c_platform_data {
 	unsigned int ven_gpio;
 	unsigned int firm_gpio;
 	unsigned int ven_isinvert;
+	void (*gpio_deinit) (void);
+	int (*check_nfc_exist)(void);
 };
